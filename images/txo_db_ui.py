@@ -26,8 +26,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
-import sqlite3
-import time
 
 # ---- config ----
 FONT_FAMILY = "Microsoft JhengHei"
@@ -429,9 +427,6 @@ def load_agg_from_db(date_from=None, date_to=None):
         })
     s.close()
     df = pd.DataFrame(recs)
-    # reuse aggregate_daily logic: need to create OI_val and transaction session normalization
-    df["未沖銷契約數"] = df["未沖銷契約數"]
-    # Convert NaN to suitable handling handled in aggregate_daily below
     return df
 
 def aggregate_daily_from_df(df):
@@ -439,10 +434,8 @@ def aggregate_daily_from_df(df):
     if df is None or df.empty:
         return pd.DataFrame()
     dfc = df.copy()
-    # we expect dfc has 交易日期, 履約價, 買賣權, 未沖銷契約數, orig_OI_str, 交易時段
     dfc["交易時段_clean"] = dfc["交易時段"].astype(str).fillna("")
     dfc["orig_OI_str"] = dfc["orig_OI_str"].astype(str).fillna("")
-    # OI_val from 未沖銷契約數
     dfc["OI_val"] = pd.to_numeric(dfc["未沖銷契約數"], errors="coerce")
     gen = dfc[dfc["交易時段_clean"] == "一般"].copy()
     if gen.empty:
@@ -473,8 +466,6 @@ def detect_anomalies_for_date(agg_day, all_agg, atm_strike=None, strike_window=D
     results["top2_inc"] = inc2.head(3).to_dict("records")
     results["top2_dec"] = dec2.head(3).to_dict("records")
     date = agg_day["交易日期"].iloc[0]
-    flag = (all_agg[all_agg["交易日期"]==date]
-            .groupby("買賣權")["OI"].count().reset_index())
     df_calls = agg_day[agg_day["買賣權"].str.contains("買", na=False)]
     df_puts = agg_day[agg_day["買賣權"].str.contains("賣", na=False)]
     if not df_calls.empty:
@@ -534,10 +525,18 @@ def make_oi_delta_bar(ax, df_day_plot, annotate_top=3):
     puts  = df_day_plot[df_day_plot["買賣權"].str.contains("賣", na=False)].set_index("履約價")["OI"].reindex(strikes).fillna(0).values
     delta_calls = df_day_plot[df_day_plot["買賣權"].str.contains("買", na=False)].set_index("履約價")["delta_1"].reindex(strikes).fillna(0).values
     delta_puts  = df_day_plot[df_day_plot["買賣權"].str.contains("賣", na=False)].set_index("履約價")["delta_1"].reindex(strikes).fillna(0).values
+    # draw main OI bars
     ax.bar(x-width/2, puts, width, label="賣權 OI")
     ax.bar(x+width/2, calls, width, label="買權 OI")
-    ax.bar(x-width/2, delta_puts, width/4)
-    ax.bar(x+width/2, delta_calls, width/4)
+    # draw delta bars: positive up, negative down
+    # calls delta
+    for i, val in enumerate(delta_calls):
+        bottom = 0 if val >= 0 else val
+        ax.bar(i+width/2, abs(val), width/4, bottom=bottom)
+    # puts delta
+    for i, val in enumerate(delta_puts):
+        bottom = 0 if val >= 0 else val
+        ax.bar(i-width/2, abs(val), width/4, bottom=bottom)
     ax.set_xticks(x)
     step = max(1, int(len(strikes)/15))
     labels = [str(int(s)) if (i%step==0 or i==0 or i==len(strikes)-1) else "" for i,s in enumerate(strikes)]
@@ -550,9 +549,12 @@ def make_oi_delta_bar(ax, df_day_plot, annotate_top=3):
         combined["abs_delta"] = combined["delta_1"].abs()
         top = combined.sort_values("abs_delta", ascending=False).head(annotate_top)
         for _, r in top.iterrows():
-            strike = int(r["履約價"])
-            cp = r["買賣權"]
-            delta = int(r["delta_1"])
+            try:
+                strike = int(r["履約價"])
+                cp = r["買賣權"]
+                delta = int(r["delta_1"])
+            except Exception:
+                continue
             i = strikes.index(strike)
             xpos = i + (width/2 if "買" in cp else -width/2)
             ax.text(xpos, max(0, r["OI"])+max(50, abs(delta))*0.02, f"{'+' if delta>0 else ''}{delta}", 
@@ -668,6 +670,14 @@ class TXOApp:
         self.df_raw = None
         self.agg = None
 
+        # Set default dates on startup (DB last date - 20 days)
+        # 如果 DB 沒資料則不填值
+        try:
+            self.set_default_dates()
+        except Exception:
+            # swallow errors - do not prevent UI from starting
+            pass
+
     # file import handlers
     def on_auto_import(self):
         cnt = auto_import_from_data_dir()
@@ -689,55 +699,86 @@ class TXOApp:
         except Exception as e:
             messagebox.showerror("匯入失敗", str(e))
 
-    # load and prepare data (from DB)
-    def load_and_prepare(self):
-        # 取得 DB 最大交易日期
+    # set default dates method
+    def set_default_dates(self):
+        """查詢 DB 最大日期，並把 date_from/date_to 填入 UI。若 DB 空，則不填。"""
         s = Session()
         last_row = s.query(OptionRaw).order_by(OptionRaw.trade_date.desc()).first()
         s.close()
-        if last_row is None:
-            messagebox.showwarning("警告", "資料庫沒有任何資料")
+        if not last_row:
+            # DB 無資料，不強制顯示錯誤，保留空白
             return
         db_max_date = last_row.trade_date
+        date_from = db_max_date - timedelta(days=20)
+        # set into UI variables (string in YYYY-MM-DD)
+        try:
+            self.date_from_var.set(str(date_from))
+            self.date_to_var.set(str(db_max_date))
+        except Exception:
+            # in case UI not fully constructed, ignore
+            pass
 
-        # 從 UI 拿日期輸入
+    # load and prepare data (from DB)
+    def load_and_prepare(self):
+        # parse date range
         dfrom = self.date_from_var.get().strip()
         dto = self.date_to_var.get().strip()
+        try:
+            # If both empty, fallback to DB last 20 days (safety)
+            s = Session()
+            mx = s.query(OptionRaw).order_by(OptionRaw.trade_date.desc()).first()
+            s.close()
+            if mx:
+                maxd = mx.trade_date
+            else:
+                maxd = None
 
-        # 處理預設日期範圍
-        # 處理預設日期範圍
-        if dfrom == "":
-            date_from = db_max_date - timedelta(days=20)
-        else:
-            date_from = pd.to_datetime(dfrom, errors="coerce").date()
+            if dfrom == "" and dto == "":
+                if maxd:
+                    date_to = maxd
+                    date_from = maxd - timedelta(days=19)  # include today -> total 20 days
+                else:
+                    messagebox.showwarning("警告", "資料庫沒有任何選擇權資料，請先匯入 CSV")
+                    return
+            else:
+                if dfrom == "":
+                    if maxd:
+                        date_from = maxd - timedelta(days=20)
+                    else:
+                        date_from = None
+                else:
+                    date_from = pd.to_datetime(dfrom, errors="coerce")
+                    if pd.isna(date_from):
+                        raise ValueError("日期格式錯誤（from）")
+                    date_from = date_from.date()
 
-        if dto == "":
-            date_to = db_max_date
-        else:
-            date_to = pd.to_datetime(dto, errors="coerce").date()
+                if dto == "":
+                    date_to = maxd if maxd else None
+                else:
+                    date_to = pd.to_datetime(dto, errors="coerce")
+                    if pd.isna(date_to):
+                        raise ValueError("日期格式錯誤（to）")
+                    date_to = date_to.date()
 
-        # ★ 必加：更新 UI 讓日期輸入框顯示出預設值 ★
-        self.date_from_var.set(str(date_from))
-        self.date_to_var.set(str(date_to))
+            if date_from is None or date_to is None:
+                messagebox.showwarning("警告", "日期範圍無法判斷，請輸入日期或匯入資料")
+                return
 
-        # 驗證合理性
-        if date_from > date_to:
-            messagebox.showerror("錯誤", "起始日不能大於結束日")
+            # ensure date_from <= date_to
+            if date_from > date_to:
+                raise ValueError("日期範圍錯誤：起始日大於結束日")
+        except Exception as e:
+            messagebox.showerror("日期錯誤", str(e))
             return
 
-
-        # 接著是你原本 load 資料 & 聚合
+        # load aggregated data from DB
         df_from_db = load_agg_from_db(date_from=date_from, date_to=date_to)
         if df_from_db is None or df_from_db.empty:
-            messagebox.showwarning("無資料", "在指定日期範圍內未找到資料")
+            messagebox.showwarning("無資料", "在指定日期範圍內未找到選擇權資料（options_raw）")
             return
         self.df_raw = df_from_db
         self.agg = aggregate_daily_from_df(self.df_raw)
-
-        messagebox.showinfo("完成", f"已載入資料：共 {len(self.agg)} 筆聚合資料")
-
-        # …（以下畫圖或其他邏輯不動）…
-
+        messagebox.showinfo("完成", f"已載入資料：{len(self.df_raw)} 筆（聚合後 {len(self.agg)} 筆）")
 
     def draw_plots(self):
         if self.agg is None or self.agg.empty:
@@ -837,7 +878,6 @@ class TXOApp:
             # 2x2 grid, use first three positions (1,1),(1,2),(2,1)
             pos = [(1,1),(1,2),(2,1)]
             for i,name in enumerate(charts[:3]):
-                row,col = pos[i]
                 ax = self.fig.add_subplot(2,2,i+1)  # subplot index works as i+1
                 ax_map[name] = ax
         else:
