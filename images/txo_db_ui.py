@@ -691,52 +691,53 @@ class TXOApp:
 
     # load and prepare data (from DB)
     def load_and_prepare(self):
-        # parse date range
+        # 取得 DB 最大交易日期
+        s = Session()
+        last_row = s.query(OptionRaw).order_by(OptionRaw.trade_date.desc()).first()
+        s.close()
+        if last_row is None:
+            messagebox.showwarning("警告", "資料庫沒有任何資料")
+            return
+        db_max_date = last_row.trade_date
+
+        # 從 UI 拿日期輸入
         dfrom = self.date_from_var.get().strip()
         dto = self.date_to_var.get().strip()
-        try:
-            if dfrom == "":
-                date_from = None
-            else:
-                date_from = pd.to_datetime(dfrom, errors="coerce")
-                if pd.isna(date_from):
-                    raise ValueError("日期格式錯誤（from）")
-                date_from = date_from.date()
-            if dto == "":
-                date_to = None
-            else:
-                date_to = pd.to_datetime(dto, errors="coerce")
-                if pd.isna(date_to):
-                    raise ValueError("日期格式錯誤（to）")
-                date_to = date_to.date()
-            # if one is None and other isn't, it's fine. If both None, default to last 30 days in DB
-            if date_from is None and date_to is None:
-                # find max date in DB
-                s = Session()
-                mx = s.query(OptionRaw).order_by(OptionRaw.trade_date.desc()).first()
-                s.close()
-                if mx:
-                    maxd = mx.trade_date
-                    date_to = maxd
-                    date_from = maxd - timedelta(days=29)
-                else:
-                    messagebox.showwarning("警告", "資料庫沒有任何選擇權資料，請先匯入 CSV")
-                    return
-            # ensure date_from <= date_to
-            if date_from is not None and date_to is not None and date_from > date_to:
-                raise ValueError("日期範圍錯誤：起始日大於結束日")
-        except Exception as e:
-            messagebox.showerror("日期錯誤", str(e))
+
+        # 處理預設日期範圍
+        # 處理預設日期範圍
+        if dfrom == "":
+            date_from = db_max_date - timedelta(days=20)
+        else:
+            date_from = pd.to_datetime(dfrom, errors="coerce").date()
+
+        if dto == "":
+            date_to = db_max_date
+        else:
+            date_to = pd.to_datetime(dto, errors="coerce").date()
+
+        # ★ 必加：更新 UI 讓日期輸入框顯示出預設值 ★
+        self.date_from_var.set(str(date_from))
+        self.date_to_var.set(str(date_to))
+
+        # 驗證合理性
+        if date_from > date_to:
+            messagebox.showerror("錯誤", "起始日不能大於結束日")
             return
 
-        # load aggregated data from DB
+
+        # 接著是你原本 load 資料 & 聚合
         df_from_db = load_agg_from_db(date_from=date_from, date_to=date_to)
         if df_from_db is None or df_from_db.empty:
-            messagebox.showwarning("無資料", "在指定日期範圍內未找到選擇權資料（options_raw）")
+            messagebox.showwarning("無資料", "在指定日期範圍內未找到資料")
             return
         self.df_raw = df_from_db
         self.agg = aggregate_daily_from_df(self.df_raw)
-        messagebox.showinfo("完成", f"已載入資料：{len(self.df_raw)} 筆（聚合後 {len(self.agg)} 筆）")
+
+        messagebox.showinfo("完成", f"已載入資料：共 {len(self.agg)} 筆聚合資料")
+
+        # …（以下畫圖或其他邏輯不動）…
+
 
     def draw_plots(self):
         if self.agg is None or self.agg.empty:
